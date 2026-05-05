@@ -1,0 +1,94 @@
+name: Web Identity Test
+on: [push, pull_request, workflow_dispatch]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  id-token: write   # mint GitHub OIDC tokens
+  contents: read
+
+jobs:
+  web-identity-test:
+    name: Web Identity Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        duckdb_version: [ '<submodule_version>' ]
+    env:
+      GEN: ninja
+      VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      DONT_STATIC_LINK_DUCKDB: 1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/duckdb-aws-ci-web-identity-test
+      AWS_ROLE_SESSION_NAME: duckdb-aws-ci
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'true'
+
+      - name: Checkout DuckDB to version
+        if: ${{ matrix.duckdb_version != '<submodule_version>'}}
+        run: |
+          cd duckdb
+          git checkout ${{ matrix.duckdb_version }}
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install Ninja
+        shell: bash
+        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build
+
+      - name: Setup Ccache
+        uses: hendrikmuhs/ccache-action@main
+        with:
+          key: ${{ github.job }}
+          save: ${{ github.ref == 'refs/heads/main' || github.repository != 'duckdb/duckdb-aws' }}
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11.1
+        with:
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+
+      - name: Build
+        shell: bash
+        run: make
+
+      # Mint OIDC token AFTER the build so the token is fresh when the test
+      # runs. GitHub OIDC tokens expire ~10 min after issuance; a build-then-
+      # mint ordering avoids the token expiring during the build step.
+      - name: Mint GitHub OIDC token
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const token = await core.getIDToken('sts.amazonaws.com');
+            core.setSecret(token);
+            const tokenPath = path.join(process.env.RUNNER_TEMP, 'aws-web-identity-token');
+            fs.writeFileSync(tokenPath, token, { mode: 0o600 });
+            core.exportVariable('AWS_WEB_IDENTITY_TOKEN_FILE', tokenPath);
+
+      - name: Verify trust chain via STS
+        shell: bash
+        run: |
+          aws sts assume-role-with-web-identity \
+            --role-arn "$AWS_ROLE_ARN" \
+            --role-session-name "$AWS_ROLE_SESSION_NAME" \
+            --web-identity-token "$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")" \
+            --query 'Credentials.{AccessKeyId:AccessKeyId,Expiration:Expiration}' \
+            --output table
+
+      - name: Test
+        shell: bash
+        run: |
+          ./build/release/test/unittest \
+            "test/sql/env/aws_secret_web_identity_env.test"
